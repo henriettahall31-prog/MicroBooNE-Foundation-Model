@@ -1,0 +1,459 @@
+"""
+Hierarchical Raster Scan for 3D Spacepoint Serialization
+=========================================================
+Reimplementation based on FM4NPP (Park et al., 2025)
+https://arxiv.org/abs/2508.14087
+
+Takes an unordered set of 3D spacepoints and serializes them into a 
+physics-informed 1D sequence suitable for Mamba / SSM input.
+
+Algorithm:
+  1. Convert Cartesian (x, y, z) → cylindrical-polar (r, φ, η)
+     where η = pseudorapidity = -ln(tan(θ/2))
+  2. Partition (r, η, φ) space into an Nr × Nη × Nφ grid of boxes
+     - r bins: aligned with detector layer boundaries (or uniform/quantile)
+     - η, φ bins: frequency-based (quantile) for balanced point counts
+  3. Inter-box ordering: sort boxes by center coordinates (r_center, φ_center, η_center)
+     so inner boxes come first, sweeping outward
+  4. Intra-box ordering: sort points within each box by r (radial, 
+     aligned with particle propagation direction)
+  5. Concatenate → 1D sequence
+
+Usage:
+  python hierarchical_raster_scan.py data.npz
+  
+  The .npz file should contain arrays: 'x', 'y', 'z' (and optionally 'energy', 'track_labels')
+"""
+
+import numpy as np
+import argparse
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Coordinate transforms
+# ─────────────────────────────────────────────────────────────────────
+
+def cartesian_to_cylindrical(x: np.ndarray, y: np.ndarray, z: np.ndarray):
+    """Convert Cartesian (x,y,z) → (r, phi, eta).
+    
+    r   = transverse radius = sqrt(x^2 + y^2)
+    phi = azimuthal angle = atan2(y, x)  ∈ [-π, π]
+    eta = pseudorapidity = -ln(tan(theta/2))
+          where theta = polar angle from beam axis (z)
+    """
+    r = np.sqrt(x**2 + y**2)
+    phi = np.arctan2(y, x)
+    
+    # theta = polar angle from beam axis (z)
+    theta = np.arctan2(r, z)
+    # Pseudorapidity: eta = -ln(tan(theta/2))
+    # Clip theta away from 0 and pi to avoid inf
+    theta = np.clip(theta, 1e-10, np.pi - 1e-10)
+    eta = -np.log(np.tan(theta / 2))
+    
+    return r, phi, eta
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Binning strategies
+# ─────────────────────────────────────────────────────────────────────
+
+def make_quantile_bins(values: np.ndarray, n_bins: int) -> np.ndarray:
+    """Create bin edges using quantile-based (frequency) binning.
+    
+    This ensures approximately equal number of points per bin,
+    matching the 'frequency-based binning' described in FM4NPP.
+    """
+    percentiles = np.linspace(0, 100, n_bins + 1)
+    edges = np.percentile(values, percentiles)
+    # Ensure unique edges (can happen with very clustered data)
+    edges = np.unique(edges)
+    return edges
+
+
+def make_uniform_bins(values: np.ndarray, n_bins: int) -> np.ndarray:
+    """Create uniformly spaced bin edges."""
+    vmin, vmax = values.min(), values.max()
+    return np.linspace(vmin, vmax, n_bins + 1)
+
+
+def make_detector_layer_bins() -> np.ndarray:
+    """Create r bins aligned with sPHENIX TPC detector layer boundaries.
+    
+    The sPHENIX TPC has 48 layers from ~20cm to ~78cm arranged in 
+    3 major groups (16 layers each). Per Appendix B of FM4NPP:
+    "The detector's 48 layers are arranged in three major groups; 
+     therefore, we create six radial bins, allocating two bins 
+     to each major detector group."
+    
+    Bin edges read from FM4NPP Figure 12 (normalized → cm):
+      Inner group  (bins 1-2): 20.0 – 25.2 – 32.3 cm
+      Middle group (bins 3-4): 32.3 – 42.9 – 55.0 cm
+      Outer group  (bins 5-6): 55.0 – 66.4 – 78.0 cm
+    """
+    return np.array([20.0, 25.2, 32.3, 42.9, 55.0, 66.4, 78.0])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Main serialization class
+# ─────────────────────────────────────────────────────────────────────
+
+@dataclass
+class HierarchicalRasterScan:
+    """Hierarchical Raster Scan serializer for 3D spacepoints.
+    
+    Parameters
+    ----------
+    n_r_bins : int
+        Number of radial bins (default: 6, as in FM4NPP)
+    n_eta_bins : int 
+        Number of pseudorapidity bins (default: 8)
+    n_phi_bins : int
+        Number of azimuthal bins (default: 8)
+    r_binning : str
+        Strategy for r bins: 'detector', 'uniform', or 'quantile'
+    eta_binning : str
+        Strategy for eta bins: 'quantile' (default, as in paper) or 'uniform'
+    phi_binning : str
+        Strategy for phi bins: 'quantile' (default, as in paper) or 'uniform'
+    """
+    n_r_bins: int = 6
+    n_eta_bins: int = 8
+    n_phi_bins: int = 8
+    r_binning: str = 'detector'
+    eta_binning: str = 'quantile'
+    phi_binning: str = 'quantile'
+    
+    # Stored after fitting
+    r_edges_: Optional[np.ndarray] = field(default=None, repr=False)
+    eta_edges_: Optional[np.ndarray] = field(default=None, repr=False)
+    phi_edges_: Optional[np.ndarray] = field(default=None, repr=False)
+    
+    def _make_bins(self, values, n_bins, strategy, axis_name=''):
+        """Create bin edges using the specified strategy."""
+        if strategy == 'quantile':
+            return make_quantile_bins(values, n_bins)
+        elif strategy == 'uniform':
+            return make_uniform_bins(values, n_bins)
+        elif strategy == 'detector' and axis_name == 'r':
+            return make_detector_layer_bins()
+        else:
+            return make_uniform_bins(values, n_bins)
+    
+    def serialize(self, x: np.ndarray, y: np.ndarray, z: np.ndarray,
+                  energy: Optional[np.ndarray] = None,
+                  return_details: bool = False):
+        """Serialize 3D spacepoints into a 1D sequence.
+        
+        Parameters
+        ----------
+        x, y, z : np.ndarray of shape (N,)
+            Cartesian coordinates of spacepoints
+        energy : np.ndarray of shape (N,), optional
+            Deposited energy per spacepoint
+        return_details : bool
+            If True, also return intermediate data for visualization
+            
+        Returns
+        -------
+        order : np.ndarray of shape (N,)
+            Indices into the original arrays giving the serialized order.
+            i.e., x[order], y[order], z[order] gives the sequence.
+        details : dict (only if return_details=True)
+            Contains r, phi, eta, box_ids, box_order, etc.
+        """
+        N = len(x)
+        assert len(y) == N and len(z) == N
+        
+        # Step 1: Coordinate transformation
+        r, phi, eta = cartesian_to_cylindrical(x, y, z)
+        
+        # Step 2: Create bins
+        self.r_edges_ = self._make_bins(r, self.n_r_bins, self.r_binning, 'r')
+        self.eta_edges_ = self._make_bins(eta, self.n_eta_bins, self.eta_binning, 'eta')
+        self.phi_edges_ = self._make_bins(phi, self.n_phi_bins, self.phi_binning, 'phi')
+        
+        # Actual number of bins (quantile may merge some)
+        actual_n_r = len(self.r_edges_) - 1
+        actual_n_eta = len(self.eta_edges_) - 1
+        actual_n_phi = len(self.phi_edges_) - 1
+        
+        # Step 3: Assign each point to a box
+        r_bin = np.clip(np.digitize(r, self.r_edges_) - 1, 0, actual_n_r - 1)
+        eta_bin = np.clip(np.digitize(eta, self.eta_edges_) - 1, 0, actual_n_eta - 1)
+        phi_bin = np.clip(np.digitize(phi, self.phi_edges_) - 1, 0, actual_n_phi - 1)
+        
+        # Composite box ID
+        box_id = (r_bin * actual_n_eta * actual_n_phi + 
+                  eta_bin * actual_n_phi + 
+                  phi_bin)
+        
+        # Step 4: Compute box centers for inter-box ordering
+        # Center of each bin
+        r_centers = 0.5 * (self.r_edges_[:-1] + self.r_edges_[1:])
+        eta_centers = 0.5 * (self.eta_edges_[:-1] + self.eta_edges_[1:])
+        phi_centers = 0.5 * (self.phi_edges_[:-1] + self.phi_edges_[1:])
+        
+        # Build a list of unique occupied boxes with their centers
+        unique_boxes = np.unique(box_id)
+        
+        box_center_r = np.zeros(len(unique_boxes))
+        box_center_eta = np.zeros(len(unique_boxes))
+        box_center_phi = np.zeros(len(unique_boxes))
+        
+        for i, bid in enumerate(unique_boxes):
+            # Decode box indices
+            ri = bid // (actual_n_eta * actual_n_phi)
+            remainder = bid % (actual_n_eta * actual_n_phi)
+            ei = remainder // actual_n_phi
+            pi = remainder % actual_n_phi
+            
+            ri = min(ri, len(r_centers) - 1)
+            ei = min(ei, len(eta_centers) - 1)
+            pi = min(pi, len(phi_centers) - 1)
+            
+            box_center_r[i] = r_centers[ri]
+            box_center_eta[i] = eta_centers[ei]
+            box_center_phi[i] = phi_centers[pi]
+        
+        # Step 5: Inter-box ordering
+        # Sort boxes by Radius → Eta → Phi (REP) per FM4NPP slide 24
+        # lexsort sorts by last key first, so argument order is (phi, eta, r)
+        inter_box_order = np.lexsort((box_center_phi, box_center_eta, box_center_r))
+        sorted_boxes = unique_boxes[inter_box_order]
+        
+        # Step 6: Intra-box ordering
+        # Per FM4NPP slide 24: "Within a cell, ordered by Radius"
+        final_order = []
+        box_assignments = []  # for visualization
+        
+        for rank, bid in enumerate(sorted_boxes):
+            # Get indices of points in this box
+            mask = box_id == bid
+            points_in_box = np.where(mask)[0]
+            
+            if len(points_in_box) == 0:
+                continue
+            
+            # Sort by radius only within each box
+            intra_order = np.argsort(r[points_in_box])
+            sorted_points = points_in_box[intra_order]
+            
+            final_order.extend(sorted_points.tolist())
+            box_assignments.extend([rank] * len(sorted_points))
+        
+        final_order = np.array(final_order, dtype=int)
+        
+        if return_details:
+            details = {
+                'r': r,
+                'phi': phi,
+                'eta': eta,
+                'r_bin': r_bin,
+                'eta_bin': eta_bin,
+                'phi_bin': phi_bin,
+                'box_id': box_id,
+                'box_order_rank': np.array(box_assignments),
+                'r_edges': self.r_edges_,
+                'eta_edges': self.eta_edges_,
+                'phi_edges': self.phi_edges_,
+                'n_occupied_boxes': len(unique_boxes),
+                'n_total_boxes': actual_n_r * actual_n_eta * actual_n_phi,
+            }
+            return final_order, details
+        
+        return final_order
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Visualization
+# ─────────────────────────────────────────────────────────────────────
+
+def plot_serialization(x, y, z, order, details, save_path='raster_scan_output.png'):
+    """Create visualization of the serialization result."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+    except ImportError:
+        print("matplotlib not available, skipping visualization")
+        return
+    
+    fig = plt.figure(figsize=(20, 12))
+    fig.suptitle('Hierarchical Raster Scan Serialization', fontsize=16, fontweight='bold')
+    
+    r = details['r']
+    phi = details['phi']
+    eta = details['eta']
+    box_ranks = details['box_order_rank']
+    seq_colors = np.arange(len(order))
+    
+    # ===== Top row: 3D Cartesian =====
+    
+    # --- Panel 1: 3D XYZ colored by sequence position ---
+    ax = fig.add_subplot(2, 3, 1, projection='3d')
+    scatter = ax.scatter(x[order], y[order], z[order], s=1, 
+                        c=seq_colors, cmap='viridis', alpha=0.5)
+    fig.colorbar(scatter, ax=ax, label='Sequence position', shrink=0.6)
+    ax.set_xlabel('x (cm)')
+    ax.set_ylabel('y (cm)')
+    ax.set_zlabel('z (cm)')
+    ax.set_title('XYZ colored by sequence position')
+    
+    # --- Panel 2: 3D XYZ colored by box rank ---
+    ax = fig.add_subplot(2, 3, 2, projection='3d')
+    scatter = ax.scatter(x[order], y[order], z[order], s=1, 
+                        c=box_ranks, cmap='tab20', alpha=0.5)
+    fig.colorbar(scatter, ax=ax, label='Box rank', shrink=0.6)
+    ax.set_xlabel('x (cm)')
+    ax.set_ylabel('y (cm)')
+    ax.set_zlabel('z (cm)')
+    ax.set_title(f'XYZ colored by box ({details["n_occupied_boxes"]}/{details["n_total_boxes"]} occupied)')
+    
+    # --- Panel 3: r vs sequence position ---
+    ax = fig.add_subplot(2, 3, 3)
+    r_seq = r[order]
+    ax.scatter(np.arange(len(order)), r_seq, s=2, c=box_ranks, 
+              cmap='tab20', alpha=0.6)
+    ax.set_xlabel('Sequence position')
+    ax.set_ylabel('r (cm)')
+    ax.set_title('Serialized: r vs sequence position')
+    box_boundaries = np.where(np.diff(box_ranks) != 0)[0]
+    for b in box_boundaries:
+        ax.axvline(b, color='k', alpha=0.08, lw=0.5)
+    
+    # ===== Bottom row: Cylindrical coordinates =====
+    
+    # --- Panel 4: (φ, r) colored by sequence position with bin edges ---
+    ax = fig.add_subplot(2, 3, 4)
+    scatter = ax.scatter(phi[order], r[order], s=1, 
+                        c=seq_colors, cmap='viridis', alpha=0.5)
+    fig.colorbar(scatter, ax=ax, label='Sequence position', shrink=0.8)
+    for edge in details['r_edges']:
+        ax.axhline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    for edge in details['phi_edges']:
+        ax.axvline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    ax.set_xlabel('φ (rad)')
+    ax.set_ylabel('r (cm)')
+    ax.set_title('(φ, r) colored by sequence position')
+    
+    # --- Panel 5: (η, r) colored by sequence position with bin edges ---
+    ax = fig.add_subplot(2, 3, 5)
+    scatter = ax.scatter(eta[order], r[order], s=1, 
+                        c=seq_colors, cmap='viridis', alpha=0.5)
+    fig.colorbar(scatter, ax=ax, label='Sequence position', shrink=0.8)
+    for edge in details['r_edges']:
+        ax.axhline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    for edge in details['eta_edges']:
+        ax.axvline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    ax.set_xlabel('η (pseudorapidity)')
+    ax.set_ylabel('r (cm)')
+    ax.set_title('(η, r) colored by sequence position')
+    
+    # --- Panel 6: (φ, r) colored by box rank with bin edges ---
+    ax = fig.add_subplot(2, 3, 6)
+    scatter = ax.scatter(phi[order], r[order], s=1, 
+                        c=box_ranks, cmap='tab20', alpha=0.5)
+    fig.colorbar(scatter, ax=ax, label='Box rank', shrink=0.8)
+    for edge in details['r_edges']:
+        ax.axhline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    for edge in details['phi_edges']:
+        ax.axvline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    ax.set_xlabel('φ (rad)')
+    ax.set_ylabel('r (cm)')
+    ax.set_title('(φ, r) colored by box rank')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved visualization to {save_path}")
+    plt.close()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description='Hierarchical Raster Scan Serialization')
+    parser.add_argument('data_file', help='Path to .npz file with sPHENIX spacepoints')
+    parser.add_argument('--event', type=int, default=0, help='Which event index to process')
+    parser.add_argument('--n-r-bins', type=int, default=6, help='Number of radial bins')
+    parser.add_argument('--n-eta-bins', type=int, default=8, help='Number of eta bins')
+    parser.add_argument('--n-phi-bins', type=int, default=8, help='Number of phi bins')
+    parser.add_argument('--output', type=str, default='raster_scan_output.png', help='Output plot path')
+    args = parser.parse_args()
+    
+    # Load data
+    print(f"Loading data from {args.data_file}")
+    raw = np.load(args.data_file)
+    all_data = raw['data']       # shape (N_total, 4) = (energy, x, y, z)
+    event_sizes = raw['size']    # number of hits per event
+    
+    print(f"Total spacepoints: {len(all_data)}")
+    print(f"Total events: {len(event_sizes)}")
+    
+    # Extract single event
+    event_idx = args.event
+    start = int(np.sum(event_sizes[:event_idx]))
+    end = start + int(event_sizes[event_idx])
+    event_data = all_data[start:end]
+    
+    energy = event_data[:, 0]
+    x = event_data[:, 1]
+    y = event_data[:, 2]
+    z = event_data[:, 3]
+    
+    print(f"Event {event_idx}: {len(x)} spacepoints")
+    
+    # Run Hierarchical Raster Scan
+    scanner = HierarchicalRasterScan(
+        n_r_bins=args.n_r_bins,
+        n_eta_bins=args.n_eta_bins,
+        n_phi_bins=args.n_phi_bins,
+        r_binning='detector',
+        eta_binning='quantile',
+        phi_binning='quantile',
+    )
+    
+    order, details = scanner.serialize(x, y, z, energy=energy, return_details=True)
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"HIERARCHICAL RASTER SCAN RESULTS")
+    print(f"{'='*60}")
+    print(f"Grid: {args.n_r_bins} × {args.n_eta_bins} × {args.n_phi_bins} "
+          f"= {details['n_total_boxes']} total boxes")
+    print(f"Occupied boxes: {details['n_occupied_boxes']}")
+    print(f"Sequence length: {len(order)}")
+    print(f"r range: [{details['r'].min():.1f}, {details['r'].max():.1f}] cm")
+    print(f"η range: [{details['eta'].min():.2f}, {details['eta'].max():.2f}]")
+    print(f"φ range: [{details['phi'].min():.2f}, {details['phi'].max():.2f}]")
+    
+    # Show first few elements of the sequence
+    print(f"\nFirst 10 points in serialized order:")
+    print(f"  {'idx':>5s}  {'r':>8s}  {'φ':>8s}  {'η':>8s}")
+    for i in range(min(10, len(order))):
+        idx = order[i]
+        print(f"  {idx:5d}  {details['r'][idx]:8.2f}  {details['phi'][idx]:8.4f}  "
+              f"{details['eta'][idx]:8.4f}")
+    
+    # Visualize
+    plot_serialization(x, y, z, order, details, save_path=args.output)
+    
+    # Save serialized output
+    out_path = args.output.replace('.png', '_data.npz')
+    np.savez(out_path,
+             order=order,
+             x_seq=x[order], y_seq=y[order], z_seq=z[order],
+             r_seq=details['r'][order],
+             phi_seq=details['phi'][order],
+             eta_seq=details['eta'][order],
+             box_rank=details['box_order_rank'])
+    print(f"Saved serialized data to {out_path}")
+
+
+if __name__ == '__main__':
+    main()
