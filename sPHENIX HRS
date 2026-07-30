@@ -1,8 +1,7 @@
 """
 Hierarchical Raster Scan for 3D Spacepoint Serialization
 =========================================================
-Reimplementation based on FM4NPP (Park et al., 2025)
-https://arxiv.org/abs/2508.14087
+Based on FM4NPP (Park et al., 2025) https://arxiv.org/abs/2508.14087
 
 Takes an unordered set of 3D spacepoints and serializes them into a 
 physics-informed 1D sequence suitable for Mamba / SSM input.
