@@ -1,12 +1,13 @@
 """
 Hierarchical Raster Scan for 3D Spacepoint Serialization
 =========================================================
-Based on FM4NPP (Park et al., 2025) https://arxiv.org/abs/2508.14087
+Reimplementation based on FM4NPP (Park et al., 2025)
+https://arxiv.org/abs/2508.14087
 
 Takes an unordered set of 3D spacepoints and serializes them into a 
 physics-informed 1D sequence suitable for Mamba / SSM input.
 
-Algorithm:
+How it works:
   1. Convert Cartesian (x, y, z) → cylindrical-polar (r, φ, η)
      where η = pseudorapidity = -ln(tan(θ/2))
   2. Partition (r, η, φ) space into an Nr × Nη × Nφ grid of boxes
@@ -78,21 +79,71 @@ def make_uniform_bins(values: np.ndarray, n_bins: int) -> np.ndarray:
     return np.linspace(vmin, vmax, n_bins + 1)
 
 
-def make_detector_layer_bins() -> np.ndarray:
-    """Create r bins aligned with sPHENIX TPC detector layer boundaries.
+def normalize(values: np.ndarray) -> tuple:
+    """Normalize values to [0, 1]. Returns (normalized, min, max)."""
+    vmin, vmax = values.min(), values.max()
+    return (values - vmin) / (vmax - vmin), vmin, vmax
+
+
+def make_detector_layer_bins(r_values: np.ndarray, n_bins: int = 6,
+                              layer_split_thresholds: list = [40, 57]) -> np.ndarray:
+    """Create r bins using quantile binning within each detector layer group.
     
-    The sPHENIX TPC has 48 layers from ~20cm to ~78cm arranged in 
-    3 major groups (16 layers each). Per Appendix B of FM4NPP:
-    "The detector's 48 layers are arranged in three major groups; 
-     therefore, we create six radial bins, allocating two bins 
-     to each major detector group."
+    Matches the FM4NPP voxelizer.py approach:
+      1. Split hits into 3 groups using layer_split_thresholds (in cm)
+      2. Allocate n_bins // 3 bins per group
+      3. Within each group, use quantile binning
     
-    Bin edges read from FM4NPP Figure 12 (normalized → cm):
-      Inner group  (bins 1-2): 20.0 – 25.2 – 32.3 cm
-      Middle group (bins 3-4): 32.3 – 42.9 – 55.0 cm
-      Outer group  (bins 5-6): 55.0 – 66.4 – 78.0 cm
+    layer_split_thresholds: boundaries between the 3 sPHENIX TPC layer groups in cm
     """
-    return np.array([20.0, 25.2, 32.3, 42.9, 55.0, 66.4, 78.0])
+    r_min, r_max = r_values.min(), r_values.max()
+    
+    # Normalize r to [0, 1]
+    r_norm = (r_values - r_min) / (r_max - r_min)
+    
+    # Normalize the layer thresholds to the same [0, 1] scale
+    thresh_norm = [(t - r_min) / (r_max - r_min) for t in layer_split_thresholds]
+    
+    # Find the midpoint gaps between layer groups (matching FM4NPP code)
+    unique_r = np.unique(r_norm)
+    section_boundaries = [unique_r.min()]
+    for t in thresh_norm:
+        below = unique_r[unique_r < t]
+        above = unique_r[unique_r >= t]
+        if len(below) > 0 and len(above) > 0:
+            midpoint = below.max() + (above.min() - below.max()) / 2
+            section_boundaries.append(midpoint)
+        else:
+            section_boundaries.append(t)
+    section_boundaries.append(unique_r.max())
+    
+    # Quantile bin within each section
+    bins_per_section = n_bins // 3
+    all_edges = []
+    for i in range(3):
+        sec_start = section_boundaries[i]
+        sec_end = section_boundaries[i + 1]
+        mask = (r_norm >= sec_start) & (r_norm <= sec_end)
+        section_data = r_norm[mask]
+        
+        if len(section_data) > 0:
+            percentiles = np.linspace(0, 100, bins_per_section + 1)
+            edges = np.percentile(section_data, percentiles)
+            edges[0] = sec_start
+            edges[-1] = sec_end
+        else:
+            edges = np.linspace(sec_start, sec_end, bins_per_section + 1)
+        
+        if i == 0:
+            all_edges.extend(edges.tolist())
+        else:
+            all_edges.extend(edges[1:].tolist())  # skip first to avoid duplicate
+    
+    # Convert back from normalized to cm
+    all_edges = np.array(all_edges)
+    all_edges = all_edges * (r_max - r_min) + r_min
+    
+    return all_edges
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -137,7 +188,7 @@ class HierarchicalRasterScan:
         elif strategy == 'uniform':
             return make_uniform_bins(values, n_bins)
         elif strategy == 'detector' and axis_name == 'r':
-            return make_detector_layer_bins()
+            return make_detector_layer_bins(values, n_bins)
         else:
             return make_uniform_bins(values, n_bins)
     
@@ -169,20 +220,33 @@ class HierarchicalRasterScan:
         # Step 1: Coordinate transformation
         r, phi, eta = cartesian_to_cylindrical(x, y, z)
         
-        # Step 2: Create bins
+        # Step 2: Normalize eta and phi to [0, 1] for binning (matching FM4NPP)
+        eta_norm, eta_min, eta_max = normalize(eta)
+        phi_norm, phi_min, phi_max = normalize(phi)
+        
+        # Step 3: Create bins
+        # r bins: data-driven quantile within detector layer groups
         self.r_edges_ = self._make_bins(r, self.n_r_bins, self.r_binning, 'r')
-        self.eta_edges_ = self._make_bins(eta, self.n_eta_bins, self.eta_binning, 'eta')
-        self.phi_edges_ = self._make_bins(phi, self.n_phi_bins, self.phi_binning, 'phi')
+        # eta/phi bins: quantile on normalized [0,1] values
+        self.eta_edges_ = self._make_bins(eta_norm, self.n_eta_bins, self.eta_binning, 'eta')
+        self.phi_edges_ = self._make_bins(phi_norm, self.n_phi_bins, self.phi_binning, 'phi')
+        # Clamp outer edges to [0, 1] (matching FM4NPP)
+        if self.eta_binning == 'quantile':
+            self.eta_edges_[0] = 0.0
+            self.eta_edges_[-1] = 1.0
+        if self.phi_binning == 'quantile':
+            self.phi_edges_[0] = 0.0
+            self.phi_edges_[-1] = 1.0
         
         # Actual number of bins (quantile may merge some)
         actual_n_r = len(self.r_edges_) - 1
         actual_n_eta = len(self.eta_edges_) - 1
         actual_n_phi = len(self.phi_edges_) - 1
         
-        # Step 3: Assign each point to a box
+        # Step 4: Assign each point to a box
         r_bin = np.clip(np.digitize(r, self.r_edges_) - 1, 0, actual_n_r - 1)
-        eta_bin = np.clip(np.digitize(eta, self.eta_edges_) - 1, 0, actual_n_eta - 1)
-        phi_bin = np.clip(np.digitize(phi, self.phi_edges_) - 1, 0, actual_n_phi - 1)
+        eta_bin = np.clip(np.digitize(eta_norm, self.eta_edges_) - 1, 0, actual_n_eta - 1)
+        phi_bin = np.clip(np.digitize(phi_norm, self.phi_edges_) - 1, 0, actual_n_phi - 1)
         
         # Composite box ID
         box_id = (r_bin * actual_n_eta * actual_n_phi + 
@@ -246,6 +310,9 @@ class HierarchicalRasterScan:
         final_order = np.array(final_order, dtype=int)
         
         if return_details:
+            # Convert normalized bin edges back to physical units for plotting
+            eta_edges_physical = self.eta_edges_ * (eta_max - eta_min) + eta_min
+            phi_edges_physical = self.phi_edges_ * (phi_max - phi_min) + phi_min
             details = {
                 'r': r,
                 'phi': phi,
@@ -256,8 +323,8 @@ class HierarchicalRasterScan:
                 'box_id': box_id,
                 'box_order_rank': np.array(box_assignments),
                 'r_edges': self.r_edges_,
-                'eta_edges': self.eta_edges_,
-                'phi_edges': self.phi_edges_,
+                'eta_edges': eta_edges_physical,
+                'phi_edges': phi_edges_physical,
                 'n_occupied_boxes': len(unique_boxes),
                 'n_total_boxes': actual_n_r * actual_n_eta * actual_n_phi,
             }
