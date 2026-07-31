@@ -1,96 +1,48 @@
 """
-Hierarchical Raster Scan for 2D Spacepoint Serialization
-=========================================================
-Based on FM4NPP (Park et al., 2025): https://arxiv.org/abs/2508.14087
+2D Hierarchical Raster Scan for MicroBooNE Wire Plane Data
+==========================================================
+Adapted from the FM4NPP 3D raster scan for sPHENIX.
 
-Takes an unordered set of 2D spacepoints and serializes them into a 
-physics-informed 1D sequence suitable for Mamba / SSM input.
+Takes 2D hits (wire, time, charge) from a single MicroBooNE wire plane
+and serializes them into a 1D sequence for Mamba / SSM input.
 
-How it Works:
-  1. Partition (x, y) space into an Nx × Ny grid of rectangles
-     - r bins: aligned with detector layer boundaries (or uniform/quantile)
-     - η, φ bins: frequency-based (quantile) for balanced point counts
-  3. Inter-box ordering: sort regions by center coordinates (x_center, y_center)
-     so inner regions come first, sweeping outward
-  4. Intra-box ordering: sort points within each box by y (up/down, 
-     aligned with particle propagation direction)
-  5. Concatenate → 1D sequence
+Algorithm:
+  1. Partition (wire, time) space into N_time × N_wire grid of boxes
+     using quantile binning on both axes
+  2. Inter-box ordering: sort boxes by (time_center, wire_center)
+     time is the primary axis (analogous to radius in sPHENIX)
+  3. Intra-box ordering: sort hits within each box by time
+  4. Concatenate → 1D sequence
 
 Usage:
-  python uboone_2d_hrs.py data.npz
-  
-  The .npz file should contain arrays: 'x', 'y', 'z' (and optionally 'energy', 'track_labels')
+  python microboone_raster_scan.py BNB_All_NoWire_00.h5 --plane 2 --event 0
 """
 
 import numpy as np
+import h5py
 import argparse
 from dataclasses import dataclass, field
 from typing import Optional
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Coordinate transforms
-# ─────────────────────────────────────────────────────────────────────
-
-def cartesian_to_cylindrical(x: np.ndarray, y: np.ndarray, z: np.ndarray):
-    """Convert Cartesian (x,y,z) → (r, phi, eta).
-    
-    r   = transverse radius = sqrt(x^2 + y^2)
-    phi = azimuthal angle = atan2(y, x)  ∈ [-π, π]
-    eta = pseudorapidity = -ln(tan(theta/2))
-          where theta = polar angle from beam axis (z)
-    """
-    r = np.sqrt(x**2 + y**2)
-    phi = np.arctan2(y, x)
-    
-    # theta = polar angle from beam axis (z)
-    theta = np.arctan2(r, z)
-    # Pseudorapidity: eta = -ln(tan(theta/2))
-    # Clip theta away from 0 and pi to avoid inf
-    theta = np.clip(theta, 1e-10, np.pi - 1e-10)
-    eta = -np.log(np.tan(theta / 2))
-    
-    return r, phi, eta
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Binning strategies
+# Binning
 # ─────────────────────────────────────────────────────────────────────
 
 def make_quantile_bins(values: np.ndarray, n_bins: int) -> np.ndarray:
-    """Create bin edges using quantile-based (frequency) binning.
-    
-    This ensures approximately equal number of points per bin,
-    matching the 'frequency-based binning' described in FM4NPP.
-    """
+    """Quantile-based binning for roughly equal hit counts per bin."""
     percentiles = np.linspace(0, 100, n_bins + 1)
     edges = np.percentile(values, percentiles)
-    # Ensure unique edges (can happen with very clustered data)
     edges = np.unique(edges)
+    edges[0] = 0.0
+    edges[-1] = 1.0
     return edges
 
 
-def make_uniform_bins(values: np.ndarray, n_bins: int) -> np.ndarray:
-    """Create uniformly spaced bin edges."""
+def normalize(values: np.ndarray) -> tuple:
+    """Normalize values to [0, 1]. Returns (normalized, min, max)."""
     vmin, vmax = values.min(), values.max()
-    return np.linspace(vmin, vmax, n_bins + 1)
-
-
-def make_detector_layer_bins() -> np.ndarray:
-    """Create r bins aligned with sPHENIX TPC detector layer boundaries.
-    
-    The sPHENIX TPC has 48 layers from ~20cm to ~78cm arranged in 
-    3 major groups (16 layers each). Per Appendix B of FM4NPP:
-    "The detector's 48 layers are arranged in three major groups; 
-     therefore, we create six radial bins, allocating two bins 
-     to each major detector group."
-    
-    Bin edges read from FM4NPP Figure 12 (normalized → cm):
-      Inner group  (bins 1-2): 20.0 – 25.2 – 32.3 cm
-      Middle group (bins 3-4): 32.3 – 42.9 – 55.0 cm
-      Outer group  (bins 5-6): 55.0 – 66.4 – 78.0 cm
-    """
-    return np.array([20.0, 25.2, 32.3, 42.9, 55.0, 66.4, 78.0])
+    return (values - vmin) / (vmax - vmin), vmin, vmax
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -98,144 +50,100 @@ def make_detector_layer_bins() -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────
 
 @dataclass
-class HierarchicalRasterScan:
-    """Hierarchical Raster Scan serializer for 3D spacepoints.
+class MicroBooNERasterScan:
+    """2D Hierarchical Raster Scan for MicroBooNE wire plane hits.
     
     Parameters
     ----------
-    n_r_bins : int
-        Number of radial bins (default: 6, as in FM4NPP)
-    n_eta_bins : int 
-        Number of pseudorapidity bins (default: 8)
-    n_phi_bins : int
-        Number of azimuthal bins (default: 8)
-    r_binning : str
-        Strategy for r bins: 'detector', 'uniform', or 'quantile'
-    eta_binning : str
-        Strategy for eta bins: 'quantile' (default, as in paper) or 'uniform'
-    phi_binning : str
-        Strategy for phi bins: 'quantile' (default, as in paper) or 'uniform'
+    n_time_bins : int
+        Number of bins along the time (drift) axis
+    n_wire_bins : int
+        Number of bins along the wire axis
     """
-    n_r_bins: int = 6
-    n_eta_bins: int = 8
-    n_phi_bins: int = 8
-    r_binning: str = 'detector'
-    eta_binning: str = 'quantile'
-    phi_binning: str = 'quantile'
+    n_time_bins: int = 8
+    n_wire_bins: int = 8
     
     # Stored after fitting
-    r_edges_: Optional[np.ndarray] = field(default=None, repr=False)
-    eta_edges_: Optional[np.ndarray] = field(default=None, repr=False)
-    phi_edges_: Optional[np.ndarray] = field(default=None, repr=False)
+    time_edges_: Optional[np.ndarray] = field(default=None, repr=False)
+    wire_edges_: Optional[np.ndarray] = field(default=None, repr=False)
     
-    def _make_bins(self, values, n_bins, strategy, axis_name=''):
-        """Create bin edges using the specified strategy."""
-        if strategy == 'quantile':
-            return make_quantile_bins(values, n_bins)
-        elif strategy == 'uniform':
-            return make_uniform_bins(values, n_bins)
-        elif strategy == 'detector' and axis_name == 'r':
-            return make_detector_layer_bins()
-        else:
-            return make_uniform_bins(values, n_bins)
-    
-    def serialize(self, x: np.ndarray, y: np.ndarray, z: np.ndarray,
-                  energy: Optional[np.ndarray] = None,
+    def serialize(self, wire: np.ndarray, time: np.ndarray,
+                  charge: Optional[np.ndarray] = None,
                   return_details: bool = False):
-        """Serialize 3D spacepoints into a 1D sequence.
+        """Serialize 2D wire plane hits into a 1D sequence.
         
         Parameters
         ----------
-        x, y, z : np.ndarray of shape (N,)
-            Cartesian coordinates of spacepoints
-        energy : np.ndarray of shape (N,), optional
-            Deposited energy per spacepoint
+        wire : np.ndarray of shape (N,)
+            Wire numbers
+        time : np.ndarray of shape (N,)
+            Drift time ticks
+        charge : np.ndarray of shape (N,), optional
+            Integrated charge per hit
         return_details : bool
-            If True, also return intermediate data for visualization
+            If True, return intermediate data for visualization
             
         Returns
         -------
         order : np.ndarray of shape (N,)
             Indices into the original arrays giving the serialized order.
-            i.e., x[order], y[order], z[order] gives the sequence.
         details : dict (only if return_details=True)
-            Contains r, phi, eta, box_ids, box_order, etc.
         """
-        N = len(x)
-        assert len(y) == N and len(z) == N
+        N = len(wire)
+        assert len(time) == N
         
-        # Step 1: Coordinate transformation
-        r, phi, eta = cartesian_to_cylindrical(x, y, z)
+        # Step 1: Normalize to [0, 1]
+        time_norm, time_min, time_max = normalize(time)
+        wire_norm, wire_min, wire_max = normalize(wire)
         
-        # Step 2: Create bins
-        self.r_edges_ = self._make_bins(r, self.n_r_bins, self.r_binning, 'r')
-        self.eta_edges_ = self._make_bins(eta, self.n_eta_bins, self.eta_binning, 'eta')
-        self.phi_edges_ = self._make_bins(phi, self.n_phi_bins, self.phi_binning, 'phi')
+        # Step 2: Create bins (quantile on normalized values)
+        self.time_edges_ = make_quantile_bins(time_norm, self.n_time_bins)
+        self.wire_edges_ = make_quantile_bins(wire_norm, self.n_wire_bins)
         
-        # Actual number of bins (quantile may merge some)
-        actual_n_r = len(self.r_edges_) - 1
-        actual_n_eta = len(self.eta_edges_) - 1
-        actual_n_phi = len(self.phi_edges_) - 1
+        actual_n_time = len(self.time_edges_) - 1
+        actual_n_wire = len(self.wire_edges_) - 1
         
-        # Step 3: Assign each point to a box
-        r_bin = np.clip(np.digitize(r, self.r_edges_) - 1, 0, actual_n_r - 1)
-        eta_bin = np.clip(np.digitize(eta, self.eta_edges_) - 1, 0, actual_n_eta - 1)
-        phi_bin = np.clip(np.digitize(phi, self.phi_edges_) - 1, 0, actual_n_phi - 1)
+        # Step 3: Assign each hit to a box
+        time_bin = np.clip(np.digitize(time_norm, self.time_edges_) - 1, 0, actual_n_time - 1)
+        wire_bin = np.clip(np.digitize(wire_norm, self.wire_edges_) - 1, 0, actual_n_wire - 1)
         
         # Composite box ID
-        box_id = (r_bin * actual_n_eta * actual_n_phi + 
-                  eta_bin * actual_n_phi + 
-                  phi_bin)
+        box_id = time_bin * actual_n_wire + wire_bin
         
         # Step 4: Compute box centers for inter-box ordering
-        # Center of each bin
-        r_centers = 0.5 * (self.r_edges_[:-1] + self.r_edges_[1:])
-        eta_centers = 0.5 * (self.eta_edges_[:-1] + self.eta_edges_[1:])
-        phi_centers = 0.5 * (self.phi_edges_[:-1] + self.phi_edges_[1:])
+        time_centers = 0.5 * (self.time_edges_[:-1] + self.time_edges_[1:])
+        wire_centers = 0.5 * (self.wire_edges_[:-1] + self.wire_edges_[1:])
         
-        # Build a list of unique occupied boxes with their centers
         unique_boxes = np.unique(box_id)
         
-        box_center_r = np.zeros(len(unique_boxes))
-        box_center_eta = np.zeros(len(unique_boxes))
-        box_center_phi = np.zeros(len(unique_boxes))
+        box_center_time = np.zeros(len(unique_boxes))
+        box_center_wire = np.zeros(len(unique_boxes))
         
         for i, bid in enumerate(unique_boxes):
-            # Decode box indices
-            ri = bid // (actual_n_eta * actual_n_phi)
-            remainder = bid % (actual_n_eta * actual_n_phi)
-            ei = remainder // actual_n_phi
-            pi = remainder % actual_n_phi
-            
-            ri = min(ri, len(r_centers) - 1)
-            ei = min(ei, len(eta_centers) - 1)
-            pi = min(pi, len(phi_centers) - 1)
-            
-            box_center_r[i] = r_centers[ri]
-            box_center_eta[i] = eta_centers[ei]
-            box_center_phi[i] = phi_centers[pi]
+            ti = bid // actual_n_wire
+            wi = bid % actual_n_wire
+            ti = min(ti, len(time_centers) - 1)
+            wi = min(wi, len(wire_centers) - 1)
+            box_center_time[i] = time_centers[ti]
+            box_center_wire[i] = wire_centers[wi]
         
-        # Step 5: Inter-box ordering
-        # Sort boxes by Radius → Eta → Phi (REP) per FM4NPP slide 24
-        # lexsort sorts by last key first, so argument order is (phi, eta, r)
-        inter_box_order = np.lexsort((box_center_phi, box_center_eta, box_center_r))
+        # Step 5: Inter-box ordering — time → wire
+        # lexsort: last key is primary, so (wire, time) means sort by time first
+        inter_box_order = np.lexsort((box_center_wire, box_center_time))
         sorted_boxes = unique_boxes[inter_box_order]
         
-        # Step 6: Intra-box ordering
-        # Per FM4NPP slide 24: "Within a cell, ordered by Radius"
+        # Step 6: Intra-box ordering — sort by time within each box
         final_order = []
-        box_assignments = []  # for visualization
+        box_assignments = []
         
         for rank, bid in enumerate(sorted_boxes):
-            # Get indices of points in this box
             mask = box_id == bid
             points_in_box = np.where(mask)[0]
             
             if len(points_in_box) == 0:
                 continue
             
-            # Sort by radius only within each box
-            intra_order = np.argsort(r[points_in_box])
+            intra_order = np.argsort(time[points_in_box])
             sorted_points = points_in_box[intra_order]
             
             final_order.extend(sorted_points.tolist())
@@ -244,20 +152,20 @@ class HierarchicalRasterScan:
         final_order = np.array(final_order, dtype=int)
         
         if return_details:
+            # Convert normalized edges back to physical units for plotting
+            time_edges_physical = self.time_edges_ * (time_max - time_min) + time_min
+            wire_edges_physical = self.wire_edges_ * (wire_max - wire_min) + wire_min
             details = {
-                'r': r,
-                'phi': phi,
-                'eta': eta,
-                'r_bin': r_bin,
-                'eta_bin': eta_bin,
-                'phi_bin': phi_bin,
+                'wire': wire,
+                'time': time,
+                'time_bin': time_bin,
+                'wire_bin': wire_bin,
                 'box_id': box_id,
                 'box_order_rank': np.array(box_assignments),
-                'r_edges': self.r_edges_,
-                'eta_edges': self.eta_edges_,
-                'phi_edges': self.phi_edges_,
+                'time_edges': time_edges_physical,
+                'wire_edges': wire_edges_physical,
                 'n_occupied_boxes': len(unique_boxes),
-                'n_total_boxes': actual_n_r * actual_n_eta * actual_n_phi,
+                'n_total_boxes': actual_n_time * actual_n_wire,
             }
             return final_order, details
         
@@ -268,100 +176,71 @@ class HierarchicalRasterScan:
 # Visualization
 # ─────────────────────────────────────────────────────────────────────
 
-def plot_serialization(x, y, z, order, details, save_path='raster_scan_output.png'):
-    """Create visualization of the serialization result."""
+def plot_serialization(wire, time, order, details, plane_id, save_path='microboone_raster_scan.png'):
+    """Visualize the 2D raster scan serialization."""
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d import Axes3D
     except ImportError:
         print("matplotlib not available, skipping visualization")
         return
     
-    fig = plt.figure(figsize=(20, 12))
-    fig.suptitle('Hierarchical Raster Scan Serialization', fontsize=16, fontweight='bold')
+    plane_names = {0: 'U (+60°)', 1: 'V (-60°)', 2: 'Y (collection)'}
+    plane_name = plane_names.get(plane_id, f'Plane {plane_id}')
     
-    r = details['r']
-    phi = details['phi']
-    eta = details['eta']
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f'MicroBooNE 2D Raster Scan — {plane_name}', fontsize=16, fontweight='bold')
+    
     box_ranks = details['box_order_rank']
     seq_colors = np.arange(len(order))
     
-    # ===== Top row: 3D Cartesian =====
+    # --- Panel 1: (wire, time) colored by sequence position ---
+    ax = axes[0, 0]
+    scatter = ax.scatter(wire[order], time[order], s=2,
+                        c=seq_colors, cmap='viridis', alpha=0.6)
+    fig.colorbar(scatter, ax=ax, label='Sequence position')
+    for edge in details['wire_edges']:
+        ax.axvline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    for edge in details['time_edges']:
+        ax.axhline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    ax.set_xlabel('Wire number')
+    ax.set_ylabel('Time tick')
+    ax.set_title('(wire, time) colored by sequence position')
     
-    # --- Panel 1: 3D XYZ colored by sequence position ---
-    ax = fig.add_subplot(2, 3, 1, projection='3d')
-    scatter = ax.scatter(x[order], y[order], z[order], s=1, 
-                        c=seq_colors, cmap='viridis', alpha=0.5)
-    fig.colorbar(scatter, ax=ax, label='Sequence position', shrink=0.6)
-    ax.set_xlabel('x (cm)')
-    ax.set_ylabel('y (cm)')
-    ax.set_zlabel('z (cm)')
-    ax.set_title('XYZ colored by sequence position')
+    # --- Panel 2: (wire, time) colored by box rank ---
+    ax = axes[0, 1]
+    scatter = ax.scatter(wire[order], time[order], s=2,
+                        c=box_ranks, cmap='tab20', alpha=0.6)
+    fig.colorbar(scatter, ax=ax, label='Box rank')
+    for edge in details['wire_edges']:
+        ax.axvline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    for edge in details['time_edges']:
+        ax.axhline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
+    ax.set_xlabel('Wire number')
+    ax.set_ylabel('Time tick')
+    ax.set_title(f'(wire, time) colored by box ({details["n_occupied_boxes"]}/{details["n_total_boxes"]} occupied)')
     
-    # --- Panel 2: 3D XYZ colored by box rank ---
-    ax = fig.add_subplot(2, 3, 2, projection='3d')
-    scatter = ax.scatter(x[order], y[order], z[order], s=1, 
-                        c=box_ranks, cmap='tab20', alpha=0.5)
-    fig.colorbar(scatter, ax=ax, label='Box rank', shrink=0.6)
-    ax.set_xlabel('x (cm)')
-    ax.set_ylabel('y (cm)')
-    ax.set_zlabel('z (cm)')
-    ax.set_title(f'XYZ colored by box ({details["n_occupied_boxes"]}/{details["n_total_boxes"]} occupied)')
-    
-    # --- Panel 3: r vs sequence position ---
-    ax = fig.add_subplot(2, 3, 3)
-    r_seq = r[order]
-    ax.scatter(np.arange(len(order)), r_seq, s=2, c=box_ranks, 
-              cmap='tab20', alpha=0.6)
+    # --- Panel 3: time vs sequence position ---
+    ax = axes[1, 0]
+    ax.scatter(np.arange(len(order)), time[order], s=2,
+              c=box_ranks, cmap='tab20', alpha=0.6)
     ax.set_xlabel('Sequence position')
-    ax.set_ylabel('r (cm)')
-    ax.set_title('Serialized: r vs sequence position')
+    ax.set_ylabel('Time tick')
+    ax.set_title('Serialized: time vs sequence position')
     box_boundaries = np.where(np.diff(box_ranks) != 0)[0]
     for b in box_boundaries:
         ax.axvline(b, color='k', alpha=0.08, lw=0.5)
     
-    # ===== Bottom row: Cylindrical coordinates =====
-    
-    # --- Panel 4: (φ, r) colored by sequence position with bin edges ---
-    ax = fig.add_subplot(2, 3, 4)
-    scatter = ax.scatter(phi[order], r[order], s=1, 
-                        c=seq_colors, cmap='viridis', alpha=0.5)
-    fig.colorbar(scatter, ax=ax, label='Sequence position', shrink=0.8)
-    for edge in details['r_edges']:
-        ax.axhline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
-    for edge in details['phi_edges']:
-        ax.axvline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
-    ax.set_xlabel('φ (rad)')
-    ax.set_ylabel('r (cm)')
-    ax.set_title('(φ, r) colored by sequence position')
-    
-    # --- Panel 5: (η, r) colored by sequence position with bin edges ---
-    ax = fig.add_subplot(2, 3, 5)
-    scatter = ax.scatter(eta[order], r[order], s=1, 
-                        c=seq_colors, cmap='viridis', alpha=0.5)
-    fig.colorbar(scatter, ax=ax, label='Sequence position', shrink=0.8)
-    for edge in details['r_edges']:
-        ax.axhline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
-    for edge in details['eta_edges']:
-        ax.axvline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
-    ax.set_xlabel('η (pseudorapidity)')
-    ax.set_ylabel('r (cm)')
-    ax.set_title('(η, r) colored by sequence position')
-    
-    # --- Panel 6: (φ, r) colored by box rank with bin edges ---
-    ax = fig.add_subplot(2, 3, 6)
-    scatter = ax.scatter(phi[order], r[order], s=1, 
-                        c=box_ranks, cmap='tab20', alpha=0.5)
-    fig.colorbar(scatter, ax=ax, label='Box rank', shrink=0.8)
-    for edge in details['r_edges']:
-        ax.axhline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
-    for edge in details['phi_edges']:
-        ax.axvline(edge, color='r', alpha=0.3, lw=0.8, linestyle='--')
-    ax.set_xlabel('φ (rad)')
-    ax.set_ylabel('r (cm)')
-    ax.set_title('(φ, r) colored by box rank')
+    # --- Panel 4: wire vs sequence position ---
+    ax = axes[1, 1]
+    ax.scatter(np.arange(len(order)), wire[order], s=2,
+              c=box_ranks, cmap='tab20', alpha=0.6)
+    ax.set_xlabel('Sequence position')
+    ax.set_ylabel('Wire number')
+    ax.set_title('Serialized: wire vs sequence position')
+    for b in box_boundaries:
+        ax.axvline(b, color='k', alpha=0.08, lw=0.5)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -374,80 +253,124 @@ def plot_serialization(x, y, z, order, details, save_path='raster_scan_output.pn
 # ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Hierarchical Raster Scan Serialization')
-    parser.add_argument('data_file', help='Path to .npz file with sPHENIX spacepoints')
+    parser = argparse.ArgumentParser(description='MicroBooNE 2D Raster Scan Serialization')
+    parser.add_argument('data_file', help='Path to MicroBooNE HDF5 file')
+    parser.add_argument('--plane', type=int, default=2, help='Wire plane (0=U, 1=V, 2=Y)')
     parser.add_argument('--event', type=int, default=0, help='Which event index to process')
-    parser.add_argument('--n-r-bins', type=int, default=6, help='Number of radial bins')
-    parser.add_argument('--n-eta-bins', type=int, default=8, help='Number of eta bins')
-    parser.add_argument('--n-phi-bins', type=int, default=8, help='Number of phi bins')
-    parser.add_argument('--output', type=str, default='raster_scan_output.png', help='Output plot path')
+    parser.add_argument('--n-time-bins', type=int, default=8, help='Number of time bins')
+    parser.add_argument('--n-wire-bins', type=int, default=8, help='Number of wire bins')
+    parser.add_argument('--output', type=str, default='microboone_raster_scan.png', help='Output plot path')
     args = parser.parse_args()
     
-    # Load data
+    # Load data — only read one event to avoid loading 674M hits
     print(f"Loading data from {args.data_file}")
-    raw = np.load(args.data_file)
-    all_data = raw['data']       # shape (N_total, 4) = (energy, x, y, z)
-    event_sizes = raw['size']    # number of hits per event
+    f = h5py.File(args.data_file, 'r')
+    h = f['hit_table']
     
-    print(f"Total spacepoints: {len(all_data)}")
-    print(f"Total events: {len(event_sizes)}")
+    total_hits = len(h['local_wire'])
+    print(f"Total hits in file: {total_hits}")
     
-    # Extract single event
-    event_idx = args.event
-    start = int(np.sum(event_sizes[:event_idx]))
-    end = start + int(event_sizes[event_idx])
-    event_data = all_data[start:end]
+    # Find target event by scanning event_id in chunks
+    print(f"Scanning for event {args.event}...")
+    chunk_size = 100000
+    current_event = -1
+    event_start = None
+    event_end = None
     
-    energy = event_data[:, 0]
-    x = event_data[:, 1]
-    y = event_data[:, 2]
-    z = event_data[:, 3]
+    for start in range(0, total_hits, chunk_size):
+        end = min(start + chunk_size, total_hits)
+        chunk_ids = h['event_id'][start:end]
+        
+        # Find unique events in this chunk
+        for i in range(len(chunk_ids)):
+            # Check if this row's event_id differs from previous
+            if i == 0 and start == 0:
+                current_event += 1
+            elif i == 0:
+                # Compare with last row of previous chunk
+                prev_id = h['event_id'][start - 1]
+                if not np.array_equal(chunk_ids[i], prev_id):
+                    current_event += 1
+            else:
+                if not np.array_equal(chunk_ids[i], chunk_ids[i - 1]):
+                    current_event += 1
+            
+            if current_event == args.event and event_start is None:
+                event_start = start + i
+            elif current_event > args.event and event_end is None:
+                event_end = start + i
+                break
+        
+        if event_end is not None:
+            break
     
-    print(f"Event {event_idx}: {len(x)} spacepoints")
+    # Handle last event in file
+    if event_start is not None and event_end is None:
+        event_end = total_hits
     
-    # Run Hierarchical Raster Scan
-    scanner = HierarchicalRasterScan(
-        n_r_bins=args.n_r_bins,
-        n_eta_bins=args.n_eta_bins,
-        n_phi_bins=args.n_phi_bins,
-        r_binning='detector',
-        eta_binning='quantile',
-        phi_binning='quantile',
+    if event_start is None:
+        print(f"Event {args.event} not found.")
+        f.close()
+        return
+    
+    print(f"Event {args.event}: rows {event_start}-{event_end} ({event_end - event_start} hits)")
+    
+    # Now load only this event's data
+    plane = h['local_plane'][event_start:event_end].flatten()
+    wire = h['local_wire'][event_start:event_end].flatten()
+    time = h['local_time'][event_start:event_end].flatten()
+    charge = h['integral'][event_start:event_end].flatten()
+    f.close()
+    
+    # Filter to selected plane
+    plane_mask = plane == args.plane
+    wire = wire[plane_mask].astype(float)
+    time = time[plane_mask].astype(float)
+    charge = charge[plane_mask].astype(float)
+    
+    plane_names = {0: 'U', 1: 'V', 2: 'Y'}
+    print(f"Event {event_idx}, Plane {args.plane} ({plane_names.get(args.plane, '?')}): {len(wire)} hits")
+    print(f"Wire range: [{wire.min():.0f}, {wire.max():.0f}]")
+    print(f"Time range: [{time.min():.1f}, {time.max():.1f}]")
+    
+    if len(wire) == 0:
+        print("No hits found for this event/plane combination.")
+        return
+    
+    # Run 2D Raster Scan
+    scanner = MicroBooNERasterScan(
+        n_time_bins=args.n_time_bins,
+        n_wire_bins=args.n_wire_bins,
     )
     
-    order, details = scanner.serialize(x, y, z, energy=energy, return_details=True)
+    order, details = scanner.serialize(wire, time, charge=charge, return_details=True)
     
     # Print summary
     print(f"\n{'='*60}")
-    print(f"HIERARCHICAL RASTER SCAN RESULTS")
+    print(f"2D RASTER SCAN RESULTS")
     print(f"{'='*60}")
-    print(f"Grid: {args.n_r_bins} × {args.n_eta_bins} × {args.n_phi_bins} "
+    print(f"Grid: {args.n_time_bins} × {args.n_wire_bins} "
           f"= {details['n_total_boxes']} total boxes")
     print(f"Occupied boxes: {details['n_occupied_boxes']}")
     print(f"Sequence length: {len(order)}")
-    print(f"r range: [{details['r'].min():.1f}, {details['r'].max():.1f}] cm")
-    print(f"η range: [{details['eta'].min():.2f}, {details['eta'].max():.2f}]")
-    print(f"φ range: [{details['phi'].min():.2f}, {details['phi'].max():.2f}]")
     
-    # Show first few elements of the sequence
-    print(f"\nFirst 10 points in serialized order:")
-    print(f"  {'idx':>5s}  {'r':>8s}  {'φ':>8s}  {'η':>8s}")
+    # Show first few elements
+    print(f"\nFirst 10 hits in serialized order:")
+    print(f"  {'idx':>5s}  {'wire':>6s}  {'time':>10s}  {'charge':>10s}")
     for i in range(min(10, len(order))):
         idx = order[i]
-        print(f"  {idx:5d}  {details['r'][idx]:8.2f}  {details['phi'][idx]:8.4f}  "
-              f"{details['eta'][idx]:8.4f}")
+        print(f"  {idx:5d}  {wire[idx]:6.0f}  {time[idx]:10.1f}  {charge[idx]:10.2f}")
     
     # Visualize
-    plot_serialization(x, y, z, order, details, save_path=args.output)
+    plot_serialization(wire, time, order, details, args.plane, save_path=args.output)
     
     # Save serialized output
     out_path = args.output.replace('.png', '_data.npz')
     np.savez(out_path,
              order=order,
-             x_seq=x[order], y_seq=y[order], z_seq=z[order],
-             r_seq=details['r'][order],
-             phi_seq=details['phi'][order],
-             eta_seq=details['eta'][order],
+             wire_seq=wire[order],
+             time_seq=time[order],
+             charge_seq=charge[order],
              box_rank=details['box_order_rank'])
     print(f"Saved serialized data to {out_path}")
 
