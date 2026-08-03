@@ -1,0 +1,291 @@
+"""
+Morton Curve (Z-order) Serialization for MicroBooNE Wire Plane Data
+===================================================================
+Based on Haiwang Yu's serialize.py from ml-dune-model.
+
+Takes 2D hits (wire, time, charge) from a single MicroBooNE wire plane
+and serializes them into a 1D sequence using a Morton (Z-order) 
+space-filling curve.
+
+How it works:
+  1. Normalize (wire, time) to [0, 1] per event
+  2. Quantize to a 16-bit integer grid
+  3. Interleave the bits of the two coordinates → Morton code
+  4. Sort hits by Morton code → 1D sequence
+
+No boxes, no partitioning — just a single global sort along the
+space-filling curve. The Z-shaped curve preserves 2D locality:
+nearby points in (wire, time) space tend to be nearby in the sequence.
+
+Usage:
+  python microboone_morton.py BNB_All_NoWire_00.h5 --plane 2 --event 0
+"""
+
+import numpy as np
+import h5py
+import os
+import argparse
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Morton curve helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def part1by1(n: np.ndarray) -> np.ndarray:
+    """Spread the low 16 bits of n into even bit positions.
+    
+    Example: input  = 0b1101
+             output = 0b01010001
+    This is the standard Morton code bit-interleaving helper.
+    """
+    n = n & 0x0000FFFF
+    n = (n | (n << 8)) & 0x00FF00FF
+    n = (n | (n << 4)) & 0x0F0F0F0F
+    n = (n | (n << 2)) & 0x33333333
+    n = (n | (n << 1)) & 0x55555555
+    return n
+
+
+def morton2d(xq: np.ndarray, yq: np.ndarray) -> np.ndarray:
+    """Interleave two 16-bit integer coordinates into a Morton code.
+    
+    The result interleaves the bits: x bits go in even positions,
+    y bits go in odd positions. This creates the Z-shaped 
+    space-filling curve pattern.
+    """
+    return part1by1(xq) | (part1by1(yq) << 1)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Main serialization
+# ─────────────────────────────────────────────────────────────────────
+
+def serialize_morton(wire: np.ndarray, time: np.ndarray, 
+                     bits: int = 16, transpose: bool = False):
+    """Serialize 2D hits along a Morton (Z-order) curve.
+    
+    Parameters
+    ----------
+    wire : np.ndarray of shape (N,)
+        Wire numbers
+    time : np.ndarray of shape (N,)
+        Drift time ticks
+    bits : int
+        Quantization resolution (16 = 65536 grid)
+    transpose : bool
+        If True, swap wire and time axes before interleaving.
+        Produces a different curve for multi-order scanning.
+    
+    Returns
+    -------
+    order : np.ndarray of shape (N,)
+        Indices giving the serialized order.
+    codes : np.ndarray of shape (N,)
+        The Morton codes (for visualization).
+    """
+    # Normalize to [0, 1]
+    wire_min, wire_max = wire.min(), wire.max()
+    time_min, time_max = time.min(), time.max()
+    
+    wire_norm = (wire - wire_min) / (wire_max - wire_min + 1e-6)
+    time_norm = (time - time_min) / (time_max - time_min + 1e-6)
+    
+    # Quantize to integer grid
+    scale = (1 << bits) - 1
+    if transpose:
+        xq = np.clip((time_norm * scale), 0, scale).astype(np.int64)
+        yq = np.clip((wire_norm * scale), 0, scale).astype(np.int64)
+    else:
+        xq = np.clip((wire_norm * scale), 0, scale).astype(np.int64)
+        yq = np.clip((time_norm * scale), 0, scale).astype(np.int64)
+    
+    # Compute Morton codes
+    codes = morton2d(xq, yq)
+    
+    # Sort by Morton code
+    order = np.argsort(codes)
+    
+    return order, codes
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Visualization
+# ─────────────────────────────────────────────────────────────────────
+
+def plot_serialization(wire, time, order, codes, plane_id, save_path='microboone_morton.png'):
+    """Visualize the Morton curve serialization."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available, skipping visualization")
+        return
+    
+    plane_names = {0: 'U (+60°)', 1: 'V (-60°)', 2: 'Y (collection)'}
+    plane_name = plane_names.get(plane_id, f'Plane {plane_id}')
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f'MicroBooNE Morton Curve Serialization — {plane_name}', fontsize=16, fontweight='bold')
+    
+    seq_colors = np.arange(len(order))
+    
+    # --- Panel 1: (wire, time) colored by sequence position ---
+    ax = axes[0, 0]
+    scatter = ax.scatter(wire[order], time[order], s=2,
+                        c=seq_colors, cmap='viridis', alpha=0.6)
+    fig.colorbar(scatter, ax=ax, label='Sequence position')
+    ax.set_xlabel('Wire number')
+    ax.set_ylabel('Time tick')
+    ax.set_title('(wire, time) colored by sequence position')
+    
+    # --- Panel 2: (wire, time) colored by Morton code ---
+    ax = axes[0, 1]
+    scatter = ax.scatter(wire[order], time[order], s=2,
+                        c=codes[order], cmap='plasma', alpha=0.6)
+    fig.colorbar(scatter, ax=ax, label='Morton code')
+    ax.set_xlabel('Wire number')
+    ax.set_ylabel('Time tick')
+    ax.set_title('(wire, time) colored by Morton code')
+    
+    # --- Panel 3: time vs sequence position ---
+    ax = axes[1, 0]
+    ax.scatter(np.arange(len(order)), time[order], s=2, alpha=0.6, c='steelblue')
+    ax.set_xlabel('Sequence position')
+    ax.set_ylabel('Time tick')
+    ax.set_title('Serialized: time vs sequence position')
+    
+    # --- Panel 4: wire vs sequence position ---
+    ax = axes[1, 1]
+    ax.scatter(np.arange(len(order)), wire[order], s=2, alpha=0.6, c='steelblue')
+    ax.set_xlabel('Sequence position')
+    ax.set_ylabel('Wire number')
+    ax.set_title('Serialized: wire vs sequence position')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved visualization to {save_path}")
+    plt.close()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description='MicroBooNE Morton Curve Serialization')
+    parser.add_argument('data_file', help='Path to MicroBooNE HDF5 file')
+    parser.add_argument('--plane', type=int, default=2, help='Wire plane (0=U, 1=V, 2=Y)')
+    parser.add_argument('--event', type=int, default=0, help='Which event index to process')
+    parser.add_argument('--transpose', action='store_true', help='Swap wire/time axes for alternate curve')
+    parser.add_argument('--output', type=str, default='microboone_morton.png', help='Output plot path')
+    args = parser.parse_args()
+    
+    # Load data — same approach as raster scan version
+    print(f"Loading data from {args.data_file}")
+    f = h5py.File(args.data_file, 'r')
+    h = f['hit_table']
+    
+    total_hits = len(h['local_wire'])
+    print(f"Total hits in file: {total_hits}")
+    
+    # Build or load event boundary index
+    cache_file = args.data_file.replace('.h5', '_event_boundaries.npy').replace('?download=1', '')
+    
+    if os.path.exists(cache_file):
+        print(f"Loading cached event boundaries from {cache_file}")
+        boundaries = np.load(cache_file)
+    else:
+        print("Building event boundary index (one-time cost)...")
+        chunk_size = 1000000
+        boundaries = [0]
+        prev_last_id = None
+        
+        for start in range(0, total_hits, chunk_size):
+            end = min(start + chunk_size, total_hits)
+            chunk_ids = h['event_id'][start:end]
+            
+            if prev_last_id is not None and not np.array_equal(chunk_ids[0], prev_last_id):
+                boundaries.append(start)
+            
+            changes = np.any(chunk_ids[1:] != chunk_ids[:-1], axis=1)
+            change_positions = np.where(changes)[0] + 1
+            for pos in change_positions:
+                boundaries.append(start + pos)
+            
+            prev_last_id = chunk_ids[-1]
+            
+            if start % 10000000 == 0:
+                print(f"  scanned {start}/{total_hits} rows, {len(boundaries)} events found...")
+        
+        boundaries = np.array(boundaries)
+        np.save(cache_file, boundaries)
+        print(f"Saved {len(boundaries)} event boundaries to {cache_file}")
+    
+    print(f"Total events: {len(boundaries)}")
+    
+    if args.event >= len(boundaries):
+        print(f"Event {args.event} not found (only {len(boundaries)} events).")
+        f.close()
+        return
+    
+    event_start = int(boundaries[args.event])
+    event_end = int(boundaries[args.event + 1]) if args.event + 1 < len(boundaries) else total_hits
+    n_hits = event_end - event_start
+    print(f"Event {args.event}: rows {event_start}-{event_end} ({n_hits} hits)")
+    
+    # Load only this event's data
+    plane = h['local_plane'][event_start:event_end].flatten()
+    wire = h['local_wire'][event_start:event_end].flatten()
+    time = h['local_time'][event_start:event_end].flatten()
+    charge = h['integral'][event_start:event_end].flatten()
+    f.close()
+    
+    # Filter to selected plane
+    plane_mask = plane == args.plane
+    wire = wire[plane_mask].astype(float)
+    time = time[plane_mask].astype(float)
+    charge = charge[plane_mask].astype(float)
+    
+    plane_names = {0: 'U', 1: 'V', 2: 'Y'}
+    print(f"Event {args.event}, Plane {args.plane} ({plane_names.get(args.plane, '?')}): {len(wire)} hits")
+    print(f"Wire range: [{wire.min():.0f}, {wire.max():.0f}]")
+    print(f"Time range: [{time.min():.1f}, {time.max():.1f}]")
+    
+    if len(wire) == 0:
+        print("No hits found for this event/plane combination.")
+        return
+    
+    # Run Morton curve serialization
+    order, codes = serialize_morton(wire, time, transpose=args.transpose)
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"MORTON CURVE RESULTS")
+    print(f"{'='*60}")
+    print(f"Sequence length: {len(order)}")
+    print(f"Transpose: {args.transpose}")
+    
+    # Show first few elements
+    print(f"\nFirst 10 hits in serialized order:")
+    print(f"  {'idx':>5s}  {'wire':>6s}  {'time':>10s}  {'charge':>10s}  {'morton':>12s}")
+    for i in range(min(10, len(order))):
+        idx = order[i]
+        print(f"  {idx:5d}  {wire[idx]:6.0f}  {time[idx]:10.1f}  {charge[idx]:10.2f}  {codes[idx]:12d}")
+    
+    # Visualize
+    plot_serialization(wire, time, order, codes, args.plane, save_path=args.output)
+    
+    # Save serialized output
+    out_path = args.output.replace('.png', '_data.npz')
+    np.savez(out_path,
+             order=order,
+             wire_seq=wire[order],
+             time_seq=time[order],
+             charge_seq=charge[order],
+             morton_codes=codes[order])
+    print(f"Saved serialized data to {out_path}")
+
+
+if __name__ == '__main__':
+    main()
