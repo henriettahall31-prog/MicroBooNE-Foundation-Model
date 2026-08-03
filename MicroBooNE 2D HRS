@@ -6,7 +6,7 @@ Adapted from the FM4NPP 3D raster scan for sPHENIX.
 Takes 2D hits (wire, time, charge) from a single MicroBooNE wire plane
 and serializes them into a 1D sequence for Mamba / SSM input.
 
-Algorithm:
+How it works:
   1. Partition (wire, time) space into N_time × N_wire grid of boxes
      using quantile binning on both axes
   2. Inter-box ordering: sort boxes by (time_center, wire_center)
